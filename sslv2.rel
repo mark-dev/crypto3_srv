@@ -1,0 +1,7 @@
+{release,{"sslv2","0.1.0"},
+         {erts,"5.10.2"},
+         [{kernel,"2.16.2"},
+          {stdlib,"1.19.2"},
+          {sasl,"2.3.2"},
+          {miscapp,"0.1.0"},
+          {tcp_server,"0.1.0"}]}.
