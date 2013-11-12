@@ -127,7 +127,7 @@ wait_for_conn_request({data, Data}, #state{socket=S,
 wait_for_auth({data,Data},#state{socket=S,
 				 encrypt_info = EI,
 				 decrypt_info = DI} = State)->
-    {_AESState1,#auth_packet{login = Login,password = Password}} = sslv2decoder:decode(Data,DI),
+    {_,#auth_packet{login = Login,password = Password}} = sslv2decoder:decode(Data,DI),
     {ReplyCode,NewState,ClientID,ClientLogin} = 
 	case ets_mgr:is_auth_valid(Login,Password) of
 	    {true,CliID} ->
@@ -140,7 +140,7 @@ wait_for_auth({data,Data},#state{socket=S,
 		{?PACKET_RESPONSE_FAIL,wait_for_auth,undefined,undefined}
 	end,
     Reply = #packet_response{code=ReplyCode},
-    {save_aes_state,_NewAESState} = reply(S,Reply,EI),
+    {save_aes_state,_} = reply(S,Reply,EI),
     {next_state,NewState,State#state{
 %			   encrypt_info = #aes_encrypt{state=NewAESState},
 				     user_id = ClientID,
@@ -158,7 +158,7 @@ ready_for_requests({data,Data},#state{socket=S,
 				      user_id = UserId,
 				      encrypt_info = EI,
 				      decrypt_info = DI} = State) ->
-    {_AESState1,Plain} = sslv2decoder:decode(Data,DI),
+    {_,Plain} = sslv2decoder:decode(Data,DI),
     {Reply,NextState} = case Plain of
 			    #get_online_users{} ->
 				{Ids,Logins} = ets_mgr:get_online_users(),
@@ -178,7 +178,7 @@ ready_for_requests({data,Data},#state{socket=S,
 				{#packet_response{code = ?PACKET_RESPONSE_FAIL},
 				 ready_for_requests}
 			end,
-    {save_aes_state,_NewAESState} = reply(S,Reply,EI),
+    {save_aes_state,_} = reply(S,Reply,EI),
     {next_state,NextState,State}.
 reply(Socket,Data) when is_binary(Data) ->
     ?log("TX: ~p ~n",[Data]),
@@ -210,9 +210,8 @@ handle_info({tcp_closed, Socket}, _StateName,#state{socket=Socket} = State) ->
 %% Кто-то написал новое сообщение твоему клиенту, отправь его.
 handle_info({send_it,Record},StateName,#state{socket=S,
 					      encrypt_info = EI}=State) ->
-    {save_aes_state,NewAESState} = reply(S,Record,EI),
-    {next_state,StateName,State#state{encrypt_info =  #aes_encrypt{state=NewAESState},
-				      decrypt_info = #aes_decrypt{state=NewAESState}}};
+    {save_aes_state,_} = reply(S,Record,EI),
+    {next_state,StateName,State};
 
 handle_info(Info, StateName, StateData) ->
     error_logger:info_msg("[~p],~p : handle_info with ~p ~n",[self(),?MODULE,Info]),
