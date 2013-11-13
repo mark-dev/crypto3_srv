@@ -35,6 +35,8 @@ encrypt(Bin,#aes_encrypt{state=State}) ->
 
 encode_record(#packet_response{code=Code})->
     {?PT_PACKET_RESPONSE,<<Code:8>>};
+encode_record(#server_change_keyspec{reason=Reason})->
+    {?PT_SERVER_CHANGE_KEY_SPEC,<<Reason:8>>};
 encode_record(#change_keyspec{public_rsa = [E,N]}) ->
     PubExpBin = integer_to_binary(E),
     ModulusBin = integer_to_binary(N),

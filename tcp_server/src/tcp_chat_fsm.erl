@@ -24,10 +24,12 @@
 	  encrypt_info, %% Как кодируем
 	  decrypt_info, %% Как декодируем
 	  user_id :: integer(),
-	  user_login :: binary()
+	  user_login :: binary(),
+	  tref %%timer reference
 	 }).
 
 -define(TIMEOUT, 120000).
+-define(KEY_TTL,20000).
 -define(log(S,R),error_logger:info_msg("[~p] ~p: " ++ S,[self(),?MODULE] ++ R)).
 -define(log(S),error_logger:info_msg("[~p] ~p: " ++ S,[self(),?MODULE])).
 %% ------------------------------------------------------------------------
@@ -81,11 +83,10 @@ wait_for_socket({socket_ready, Socket}, State) when is_port(Socket) ->
 %%
 wait_for_change_cihper({data, Data}, #state{socket=S} = State) ->
     #change_keyspec{public_rsa = ClientPub} = sslv2decoder:decode(Data),
-    ?log("ClientPub = ~p ~n",[ClientPub]),
     {ServPub,ServPriv} = erl_make_certs_wrap:gen_key(128),
     Reply = #change_keyspec{public_rsa = ServPub},
-    ?log("ServerPub = ~p ~n",[ServPub]),
     reply(S,Reply),
+    ?log("RSA key exchange finished ~n"),
     {next_state,wait_for_aes_key,State#state{decrypt_info = #rsa_decrypt{private = ServPriv},
 					     encrypt_info = #rsa_encrypt{public = ClientPub}}}.
 %%
@@ -94,12 +95,12 @@ wait_for_change_cihper({data, Data}, #state{socket=S} = State) ->
 wait_for_aes_key({data, Data}, #state{socket=S,
 				      decrypt_info=DI} = State) ->
     #aes_key{key=AesKey} = sslv2decoder:decode(Data,DI),
-    ?log("aes_key: ~p ~n",[AesKey]),
     AESState = crypto:stream_init(aes_ctr, AesKey, AesKey),
     Reply = #packet_response{code=?PACKET_RESPONSE_OK},
-    {save_aes_state,_NewAESState} = reply(S,Reply,#aes_encrypt{state=AESState}),
+    reply(S,Reply,#aes_encrypt{state=AESState}),
+    TRef = create_key_ttl_timer(?KEY_TTL),
     {next_state,wait_for_conn_request,State#state{decrypt_info = #aes_decrypt{state=AESState},
-						  encrypt_info = #aes_encrypt{state=AESState}}}.
+						  encrypt_info = #aes_encrypt{state=AESState},						 		tref = TRef}}.
 
 %%
 %% WAIT_FOR_CONN_REQUEST - ожидает сертификат клиента
@@ -140,46 +141,44 @@ wait_for_auth({data,Data},#state{socket=S,
 		{?PACKET_RESPONSE_FAIL,wait_for_auth,undefined,undefined}
 	end,
     Reply = #packet_response{code=ReplyCode},
-    {save_aes_state,_} = reply(S,Reply,EI),
-    {next_state,NewState,State#state{
-%			   encrypt_info = #aes_encrypt{state=NewAESState},
-				     user_id = ClientID,
-				     user_login = ClientLogin
-%,
-			%	     decrypt_info = #aes_decrypt{state=NewAESState}
-			  }}.
+    reply(S,Reply,EI),
+    {next_state,NewState,State#state{ user_id = ClientID, user_login = ClientLogin}}.
 
 %%
 %% READY_FOR_REQUESTS - обрабатывает запросы
 %%
 
 ready_for_requests({data,Data},#state{socket=S,
-				      user_login = Login,
 				      user_id = UserId,
+				      tref = TRef,
 				      encrypt_info = EI,
 				      decrypt_info = DI} = State) ->
     {_,Plain} = sslv2decoder:decode(Data,DI),
-    {Reply,NextState} = case Plain of
+    {Reply,NewState} = case Plain of
 			    #get_online_users{} ->
 				{Ids,Logins} = ets_mgr:get_online_users(),
 				{#online_users_response{ids = Ids,logins = Logins},
-				 ready_for_requests};
+				 State};
 			    #data_transfer{} = DT ->
 				notify_about_new_msgs(UserId,DT),
 				{#packet_response{code = ?PACKET_RESPONSE_OK},
-				 ready_for_requests};
-			    #client_want_change_keyspec{} ->
-				ets_mgr:client_disconnected(UserId,Login,self()),
-				broadcast_that_client_disconnected(UserId),
-				{#packet_response{code = ?PACKET_RESPONSE_OK},
-				 wait_for_change_cihper};
+				 State};
+			    #aes_key{key=NewAesKey} ->
+			       cancel_key_ttl_timer(TRef),
+			       ?log("Got new AES key from client"),
+			       AESState = crypto:stream_init(aes_ctr, NewAesKey, NewAesKey),
+			       NewTRef = create_key_ttl_timer(?KEY_TTL),
+				{noreply,
+				 State#state{encrypt_info = #aes_encrypt{state=AESState},
+					     tref = NewTRef,
+					     decrypt_info = #aes_decrypt{state=AESState}}};
 			    Other ->
 				?log("unknown RX when ready_for_requests ~p ~n",[Other]),
 				{#packet_response{code = ?PACKET_RESPONSE_FAIL},
-				 ready_for_requests}
+				 State}
 			end,
-    {save_aes_state,_} = reply(S,Reply,EI),
-    {next_state,NextState,State}.
+    Reply /= noreply andalso reply(S,Reply,EI),
+    {next_state,ready_for_requests,NewState}.
 reply(Socket,Data) when is_binary(Data) ->
     ?log("TX: ~p ~n",[Data]),
     gen_tcp:send(Socket,Data);
@@ -206,11 +205,13 @@ handle_info({tcp, Socket, Bin}, StateName, #state{socket=Socket} = StateData) ->
 %% Клиент отключился
 handle_info({tcp_closed, Socket}, _StateName,#state{socket=Socket} = State) ->
     {stop, normal, State};
-
+handle_info(key_ttl_expired,StateName,#state{socket=S,encrypt_info = EI} = State) ->
+    reply(S,#server_change_keyspec{reason = ?CHANGE_KEYSPEC_REASON_TTL},EI),
+    {next_state,StateName,State};
 %% Кто-то написал новое сообщение твоему клиенту, отправь его.
 handle_info({send_it,Record},StateName,#state{socket=S,
 					      encrypt_info = EI}=State) ->
-    {save_aes_state,_} = reply(S,Record,EI),
+    reply(S,Record,EI),
     {next_state,StateName,State};
 
 handle_info(Info, StateName, StateData) ->
@@ -264,3 +265,9 @@ notify_about_new_msgs(From,#data_transfer{recipient=ToID,
 	{error,not_found} ->
 	    error_logger:info_msg("Pid for clientID = ~p not found" ,[ToID])
     end.
+
+cancel_key_ttl_timer(TRef)->
+    erlang:cancel_timer(TRef).
+
+create_key_ttl_timer(Timeout)->
+    erlang:send_after(Timeout,self(),key_ttl_expired).
